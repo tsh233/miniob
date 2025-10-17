@@ -176,6 +176,78 @@ RC Db::create_table(const char *table_name, span<const AttrInfoSqlNode> attribut
   return RC::SUCCESS;
 }
 
+RC Db::drop_table(const char *table_name)
+{
+  if (table_name == nullptr || common::is_blank(table_name)) {
+    LOG_WARN("Invalid table name");
+    return RC::INVALID_ARGUMENT;
+  }
+
+  auto iter = opened_tables_.find(table_name);
+  if (iter == opened_tables_.end()) {
+    // table may not be opened but meta file may exist; check meta file
+    string meta = table_meta_file(path_.c_str(), table_name);
+    if (!filesystem::exists(meta)) {
+      LOG_WARN("Table not exist: %s", table_name);
+      return RC::SCHEMA_TABLE_NOT_EXIST;
+    }
+    // if not opened, try remove files directly
+  }
+
+  // if opened, delete object and close related files
+  if (iter != opened_tables_.end()) {
+    Table *table = iter->second;
+    // remove from opened tables first
+    opened_tables_.erase(iter);
+    delete table; // destructor will close engines, indexes and buffer pools
+  }
+
+  // remove meta/data/index/lob files
+  error_code ec;
+  string meta_file = table_meta_file(path_.c_str(), table_name);
+  if (filesystem::exists(meta_file)) {
+    filesystem::remove(meta_file, ec);
+    if (ec) {
+      LOG_WARN("Failed to remove table meta file %s: %s", meta_file.c_str(), ec.message().c_str());
+    }
+  }
+
+  string data_file = table_data_file(path_.c_str(), table_name);
+  if (filesystem::exists(data_file)) {
+    // close file in buffer pool manager if opened
+    buffer_pool_manager_->close_file(data_file.c_str());
+    filesystem::remove(data_file, ec);
+    if (ec) {
+      LOG_WARN("Failed to remove table data file %s: %s", data_file.c_str(), ec.message().c_str());
+    }
+  }
+
+  string lob_file = table_lob_file(path_.c_str(), table_name);
+  if (filesystem::exists(lob_file)) {
+    filesystem::remove(lob_file, ec);
+    if (ec) {
+      LOG_WARN("Failed to remove table lob file %s: %s", lob_file.c_str(), ec.message().c_str());
+    }
+  }
+
+  // remove index files by trying to find meta and parsing index names
+  // simplest: remove files that match prefix table_name-*.index
+  vector<string> files;
+  int ret = list_file(path_.c_str(), (string("^") + table_name + "-.*\\.index$").c_str(), files);
+  if (ret >= 0) {
+    for (const string &f : files) {
+      filesystem::path p = filesystem::path(path_) / f;
+      filesystem::remove(p, ec);
+      if (ec) {
+        LOG_WARN("Failed to remove index file %s: %s", p.c_str(), ec.message().c_str());
+      }
+    }
+  }
+
+  LOG_INFO("Drop table success. table=%s", table_name);
+  return RC::SUCCESS;
+}
+
 Table *Db::find_table(const char *table_name) const
 {
   unordered_map<string, Table *>::const_iterator iter = opened_tables_.find(table_name);
